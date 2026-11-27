@@ -1,0 +1,45 @@
+# Environments
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/
+
+# Secrets (never commit)
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+kaggle.json
+secrets/
+
+# Data, runs and model artefacts live in cloud storage, not in Git.
+# (patterns end in /* so that a small .gitkeep can be re-included)
+data/
+datasets/
+runs/*
+!runs/.gitkeep
+logs/
+outputs/
+exports/
+checkpoints/
+weights/*
+!weights/.gitkeep
+*.pth
+*.pt
+*.ckpt
+*.nii
+*.nii.gz
+*.dcm
+*.npz
+cache/
+monai_cache/
+
+# Notebooks / OS
+.ipynb_checkpoints/
+.DS_Store
+Thumbs.db
+
+# Split manifests, configs and the test-use registry ARE tracked: do not add splits/ or configs/ here.

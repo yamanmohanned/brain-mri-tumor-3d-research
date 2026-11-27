@@ -1,0 +1,21 @@
+# Default training configuration (mirrors braintumor.train.TrainConfig). Override on the command line, e.g.
+#   python -m braintumor.train --config configs/train.yaml --data-root <BraTS folder> --out runs/segresnet_v2
+# The resolved config is copied into every run directory for reproducibility.
+manifest: splits/legacy_seed42.json     # patient-level split; the 'test' split is never loaded by train.py
+arch: segresnet                         # segresnet | unet (identical to the notebook, so checkpoints are interchangeable)
+epochs: 150                             # the notebook stopped at 30 epochs with validation Dice still rising (0.52 @10 -> 0.76 @30)
+warmup_epochs: 3
+lr: 1.0e-4
+weight_decay: 1.0e-5
+batch_size: 2                           # fits a 15 GB T4 with AMP at 128^3; reduced automatically on <9 GB GPUs
+roi: [128, 128, 128]
+val_interval: 5
+patience: 12                            # validation checks without improvement before early stopping
+min_delta: 0.001
+loss: dicece                            # dice (notebook) | dicece (Dice + BCE; not yet ablated)
+amp: true
+num_workers: 2
+cache: true                             # on-disk MONAI PersistentDataset cache of the deterministic transforms
+seed: 42
+flip_axes: [0]                          # left-right only (anatomy-preserving)
+sw_overlap: 0.25

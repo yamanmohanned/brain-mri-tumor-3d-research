@@ -1,0 +1,5 @@
+* text=auto
+*.ipynb -text
+*.json text eol=lf
+*.pth binary
+*.nii.gz binary
