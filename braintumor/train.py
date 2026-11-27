@@ -1,28 +1,33 @@
-"""Training (GPU strongly recommended). Patient-level splits only; the TEST split is never loaded here.
+"""Training (GPU required; designed for interruptible cloud sessions). Patient-level splits only; the TEST/EXTERNAL splits are never loaded here.
 
-    python -m braintumor.train --data-root <BraTS folder> --manifest splits/legacy_seed42.json --out runs/segresnet --epochs 150
+    python -m braintumor.train --data-root <BraTS folder> --manifest splits/legacy_seed42.json --out <persistent dir>/segresnet_v2 --epochs 150
     python -m braintumor.train ... --benchmark          # time a few steps and estimate the full cost, then exit
-    python -m braintumor.train ... --resume             # continue from <out>/last.pth
+    python -m braintumor.train ... --resume             # continue from <out>/last.pth (model, optimiser, scheduler, scaler, history)
+    python -m braintumor.train ... --max-hours 3.5      # stop cleanly after the epoch that crosses the budget (session limits); resume later
+
+Cloud-session safety: ``last.pth`` is rewritten atomically every epoch, the best model is versioned under ``versions/``, every epoch appends one
+line to ``metrics.jsonl``, and ``--cache-dir`` lets the (large, rebuildable) MONAI cache live on fast local disk while ``--out`` sits on persistent storage.
 
 Differences from the notebook (each justified; none has been ablated yet - see REPORT.md):
-  * Dice + BCE loss: the notebook's Dice-only loss (smooth_nr=0) gives *zero gradient* for a region absent in the patch, so false
-    positives for absent regions (typically ET) are never penalised.
+  * Dice + BCE loss (also dicefocal / gdice): the notebook's Dice-only loss (smooth_nr=0) has *zero gradient* for a region absent from the patch.
   * Left-right flips only + mild affine/noise instead of flips on all three axes (A-P / S-I flips produce impossible anatomy).
   * Linear warm-up + cosine schedule over the *real* number of epochs (the notebook stopped at 30 epochs with loss still falling).
   * Validation Dice uses the BraTS empty-region convention (the notebook's MONAI DiceMetric silently dropped empty-GT cases).
-  * Atomic checkpoints, run-directory protection, early stopping, resume, saved config/environment/manifest hash.
+  * Micro-batch / gradient accumulation adapt to the GPU actually present; atomic checkpoints, resume, early stopping, run-directory protection.
 """
 from __future__ import annotations
 
 import argparse
 import dataclasses
+import hashlib
 import json
 import logging
+import math
 import os
 import platform
-import sys
+import subprocess
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
@@ -35,32 +40,39 @@ from .model import build_model, save_checkpoint, update_card
 from .splits import load_manifest
 
 log = logging.getLogger("braintumor.train")
+LOSSES = ("dice", "dicece", "dicefocal", "gdice")
 
 
 @dataclass
 class TrainConfig:
-    data_root: str = ""
+    data_root: str = ""                 # BraTS-2020-style root (back-compat); use data_roots for several datasets
+    data_roots: dict | None = None      # {registry dataset name: path}
     manifest: str = "splits/legacy_seed42.json"
     out_dir: str = "runs/segresnet"
+    cache_dir: str = ""                 # default: <out_dir>/cache (set to local disk when out_dir is on network storage)
     arch: str = "segresnet"
     epochs: int = 150
     warmup_epochs: int = 3
     lr: float = 1e-4
     weight_decay: float = 1e-5
-    batch_size: int = 2
+    batch_size: int = 2                 # EFFECTIVE batch (micro-batch x accum_steps)
+    accum_steps: int = 1
+    auto_batch: bool = True             # pick micro-batch from free VRAM, raise accum_steps to keep the effective batch
     roi: tuple = (128, 128, 128)
     val_interval: int = 5
-    patience: int = 12            # in validation checks (x val_interval epochs)
+    patience: int = 12                  # validation checks without improvement before early stopping
     min_delta: float = 1e-3
-    loss: str = "dicece"          # "dicece" | "dice" (notebook)
+    loss: str = "dicece"                # dice (notebook) | dicece | dicefocal | gdice
     amp: bool = True
     num_workers: int = 2
     cache: bool = True
     seed: int = 42
+    deterministic: bool = False
     device: str = "auto"
     flip_axes: tuple = (0,)
     sw_overlap: float = 0.25
-    max_train_cases: int = 0      # 0 = all (for smoke tests only)
+    max_hours: float = 0.0              # 0 = no wall-clock budget
+    max_train_cases: int = 0            # 0 = all (smoke tests only)
     max_val_cases: int = 0
     allow_cpu: bool = False
 
@@ -75,17 +87,22 @@ class TrainConfig:
 
 
 class CombinedLoss(torch.nn.Module):
-    """Squared-Dice (sigmoid, multi-label) + optional BCE."""
+    """Squared-Dice (sigmoid, multi-label) plus an optional pixel-wise term (BCE / focal) or Generalized Dice with BCE."""
 
     def __init__(self, kind: str = "dicece"):
         super().__init__()
-        from monai.losses import DiceLoss
-        self.dice = DiceLoss(to_onehot_y=False, sigmoid=True, squared_pred=True, smooth_nr=0, smooth_dr=1e-5)
-        self.bce = torch.nn.BCEWithLogitsLoss() if kind == "dicece" else None
+        from monai.losses import DiceLoss, FocalLoss, GeneralizedDiceLoss
+        if kind not in LOSSES:
+            raise ValueError(f"loss must be one of {LOSSES}")
+        self.kind = kind
+        self.dice = GeneralizedDiceLoss(sigmoid=True, to_onehot_y=False) if kind == "gdice" else \
+            DiceLoss(to_onehot_y=False, sigmoid=True, squared_pred=True, smooth_nr=0, smooth_dr=1e-5)
+        self.pix = {"dice": None, "dicece": torch.nn.BCEWithLogitsLoss(), "gdice": torch.nn.BCEWithLogitsLoss(),
+                    "dicefocal": FocalLoss(to_onehot_y=False, gamma=2.0, use_softmax=False)}[kind]
 
     def forward(self, logits, target):
         loss = self.dice(logits, target)
-        return loss + self.bce(logits, target) if self.bce is not None else loss
+        return loss + self.pix(logits, target) if self.pix is not None else loss
 
 
 def batch_dice(pred: torch.Tensor, gt: torch.Tensor) -> torch.Tensor:
@@ -93,6 +110,23 @@ def batch_dice(pred: torch.Tensor, gt: torch.Tensor) -> torch.Tensor:
     p, g = pred.flatten(1).float(), gt.flatten(1).float()
     inter, s = (p * g).sum(1), p.sum(1) + g.sum(1)
     return torch.where(s == 0, torch.ones_like(s), 2 * inter / s.clamp_min(1))
+
+
+def adapt_batch(cfg: TrainConfig, device: torch.device) -> dict:
+    """Choose micro-batch / accumulation for the GPU that is actually present (CPU: untouched). Effective batch is preserved."""
+    info = {"device": str(device)}
+    if device.type != "cuda":
+        return info
+    props = torch.cuda.get_device_properties(device)
+    free, total = (x / 2 ** 30 for x in torch.cuda.mem_get_info(device))
+    info.update(gpu=props.name, vram_total_gb=round(total, 1), vram_free_gb=round(free, 1), compute_capability=f"{props.major}.{props.minor}")
+    eff = cfg.batch_size * cfg.accum_steps
+    if cfg.auto_batch:
+        micro = 4 if free >= 20 else 2 if free >= 11 else 1       # 128^3 SegResNet with AMP: ~7 GB/sample on a T4 in the notebook (batch 2 fit 15 GB)
+        micro = min(micro, eff)
+        cfg.batch_size, cfg.accum_steps = micro, math.ceil(eff / micro)
+        info["adapted"] = f"micro-batch {cfg.batch_size} x accumulation {cfg.accum_steps} (effective {cfg.batch_size * cfg.accum_steps})"
+    return info
 
 
 def estimate_cost(cfg: TrainConfig, device: torch.device, n_train: int, n_val: int, steps: int = 3) -> dict:
@@ -116,7 +150,8 @@ def estimate_cost(cfg: TrainConfig, device: torch.device, n_train: int, n_val: i
         if i:  # skip warm-up step
             times.append(time.time() - t)
     step_s = float(np.mean(times))
-    train_epoch_s = step_s * int(np.ceil(n_train / cfg.batch_size))
+    n_steps = int(np.ceil(n_train / cfg.batch_size))
+    train_epoch_s = step_s * n_steps
     model.eval()
     with torch.inference_mode():
         t = time.time()
@@ -133,6 +168,13 @@ def _atomic_save(obj, path: Path) -> None:
     tmp = path.with_suffix(".tmp")
     torch.save(obj, tmp)
     os.replace(tmp, path)
+
+
+def _git_commit() -> str | None:
+    try:
+        return subprocess.run(["git", "rev-parse", "HEAD"], cwd=Path(__file__).resolve().parents[1], capture_output=True, text=True, timeout=5).stdout.strip() or None
+    except Exception:
+        return None
 
 
 def plot_history(hist: dict, path: Path) -> None:
@@ -153,31 +195,29 @@ def plot_history(hist: dict, path: Path) -> None:
 
 
 def run(cfg: TrainConfig, resume: bool = False, benchmark: bool = False) -> dict:
-    from monai.data import DataLoader, PersistentDataset, Dataset
+    from monai.data import DataLoader, Dataset, PersistentDataset
     from monai.inferers import sliding_window_inference
 
-    from .data import build_transforms, discover_cases, select
+    from .data import build_transforms, discover_many, select
+    from .datasets import load_registry
 
     device = pick_device(cfg.device)
+    hw = adapt_batch(cfg, device)
     man = load_manifest(cfg.manifest)
-    train_ids, val_ids = man["splits"]["train"], man["splits"]["val"]       # NOTE: 'test' is deliberately never read in this module
+    train_ids, val_ids = man["splits"]["train"], man["splits"]["val"]       # NOTE: 'test', 'test_legacy' and 'external' are deliberately never read here
     if cfg.max_train_cases:
         train_ids = train_ids[: cfg.max_train_cases]
     if cfg.max_val_cases:
         val_ids = val_ids[: cfg.max_val_cases]
 
     est = estimate_cost(cfg, device, len(train_ids), len(val_ids))
+    print("Hardware:", json.dumps(hw))
     print("Cost estimate:", json.dumps(est))
     if benchmark:
-        return {"estimate": est}
+        return {"hardware": hw, "estimate": est}
     if device.type == "cpu" and not cfg.allow_cpu:
         raise SystemExit(f"Refusing to train on CPU: ~{est['seconds_per_epoch'] / 3600:.1f} h per epoch, ~{est['estimated_total_hours']:.0f} h in total "
-                         f"for {cfg.epochs} epochs. Use a GPU (e.g. Colab T4: ~1.5 min/epoch for the notebook's setup) or pass --allow-cpu for a smoke test.")
-    if device.type == "cuda":
-        vram = torch.cuda.get_device_properties(0).total_memory / 2 ** 30
-        if vram < 9 and cfg.batch_size > 1:
-            log.warning("only %.1f GB VRAM: reducing batch size to 1", vram)
-            cfg.batch_size = 1
+                         f"for {cfg.epochs} epochs. Use a cloud GPU (see USER_GUIDE.md) or pass --allow-cpu for a smoke test.")
 
     out = Path(cfg.out_dir)
     out.mkdir(parents=True, exist_ok=True)
@@ -185,24 +225,31 @@ def run(cfg: TrainConfig, resume: bool = False, benchmark: bool = False) -> dict
     if last_p.exists() and not resume:
         raise FileExistsError(f"{last_p} exists: pass --resume to continue, or choose a new --out (existing runs are never overwritten)")
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s", handlers=[logging.StreamHandler(), logging.FileHandler(out / "train.log")])
-    (out / "config.yaml").write_text(yaml.safe_dump({k: (list(v) if isinstance(v, tuple) else v) for k, v in dataclasses.asdict(cfg).items()}))
+    cfg_dict = {k: (list(v) if isinstance(v, tuple) else v) for k, v in dataclasses.asdict(cfg).items()}
+    (out / "config.yaml").write_text(yaml.safe_dump(cfg_dict))
     (out / "environment.json").write_text(json.dumps({
-        "braintumor": __version__, "python": platform.python_version(), "torch": torch.__version__, "device": str(device), "platform": platform.platform(),
-        "monai": __import__("monai").__version__, "manifest_sha256": man["file_sha256"], "manifest_method": man["method"], "n_train": len(train_ids), "n_val": len(val_ids),
-        "cost_estimate": est}, indent=1))
+        "braintumor": __version__, "git_commit": _git_commit(), "python": platform.python_version(), "torch": torch.__version__, "cuda": torch.version.cuda,
+        "hardware": hw, "platform": platform.platform(), "monai": __import__("monai").__version__, "manifest_sha256": man["file_sha256"],
+        "manifest_method": man["method"], "n_train": len(train_ids), "n_val": len(val_ids), "cost_estimate": est,
+        "config_sha256": hashlib.sha256(json.dumps(cfg_dict, sort_keys=True, default=str).encode()).hexdigest()}, indent=1))
 
-    cases, skipped = discover_cases(cfg.data_root)
+    reg = load_registry()
+    roots = cfg.data_roots or {"brats2020": cfg.data_root}
+    cases, skipped = discover_many(roots, reg)
     train_files, val_files = select(cases, train_ids), select(cases, val_ids)
+    if cfg.deterministic:
+        from monai.utils import set_determinism
+        set_determinism(cfg.seed)
     torch.manual_seed(cfg.seed)
     np.random.seed(cfg.seed)
-    cache = out / "cache"
+    cache = Path(cfg.cache_dir) if cfg.cache_dir else out / "cache"
     tr_t, va_t = build_transforms(True, cfg.roi, cfg.flip_axes), build_transforms(False)
     train_ds = PersistentDataset(train_files, tr_t, cache_dir=cache / "train") if cfg.cache else Dataset(train_files, tr_t)
     val_ds = PersistentDataset(val_files, va_t, cache_dir=cache / "val") if cfg.cache else Dataset(val_files, va_t)
     val_loader = DataLoader(val_ds, batch_size=1, shuffle=False, num_workers=min(cfg.num_workers, 2))
 
     model = build_model(cfg.arch).to(device)
-    loss_fn = CombinedLoss(cfg.loss)
+    loss_fn = CombinedLoss(cfg.loss).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
     warm = max(cfg.warmup_epochs, 0)
     sched = torch.optim.lr_scheduler.SequentialLR(opt, [torch.optim.lr_scheduler.LinearLR(opt, 0.1, 1.0, total_iters=max(warm, 1)),
@@ -221,26 +268,35 @@ def run(cfg: TrainConfig, resume: bool = False, benchmark: bool = False) -> dict
         log.info("resumed from epoch %d (best val mean Dice %.4f)", ck["epoch"], best)
 
     t_start = time.time()
+    budget_s = cfg.max_hours * 3600 if cfg.max_hours else None
+    paused = False
+    epoch = start - 1
     for epoch in range(start, cfg.epochs + 1):
+        t_ep = time.time()
         g = torch.Generator().manual_seed(cfg.seed + epoch)                  # per-epoch seed -> resume-consistent shuffling
-        train_ds.set_random_state(cfg.seed + epoch) if hasattr(train_ds, "set_random_state") else None
+        if hasattr(train_ds, "set_random_state"):
+            train_ds.set_random_state(cfg.seed + epoch)
         loader = DataLoader(train_ds, batch_size=cfg.batch_size, shuffle=True, num_workers=cfg.num_workers, generator=g, drop_last=False)
         model.train()
         run_loss, n = 0.0, 0
-        for b in loader:
+        opt.zero_grad(set_to_none=True)
+        for i, b in enumerate(loader, 1):
             x, y = b["image"].to(device, non_blocking=True), b["label"].to(device, non_blocking=True)
-            opt.zero_grad(set_to_none=True)
             with torch.autocast(device.type, enabled=use_amp):
                 loss = loss_fn(model(x), y)
-            scaler.scale(loss).backward()
-            scaler.step(opt)
-            scaler.update()
+            scaler.scale(loss / cfg.accum_steps).backward()
+            if i % cfg.accum_steps == 0 or i == len(loader):                 # accumulate, then step (also flush the last partial group)
+                scaler.step(opt)
+                scaler.update()
+                opt.zero_grad(set_to_none=True)
             run_loss += float(loss.item())
             n += 1
         sched.step()
         hist["epoch_train"].append(epoch)
         hist["train_loss"].append(run_loss / max(n, 1))
-        log.info("epoch %d/%d loss %.4f lr %.2e (%.0fs elapsed)", epoch, cfg.epochs, run_loss / max(n, 1), opt.param_groups[0]["lr"], time.time() - t_start)
+        rec = {"epoch": epoch, "train_loss": run_loss / max(n, 1), "lr": opt.param_groups[0]["lr"], "epoch_seconds": round(time.time() - t_ep, 1),
+               "peak_gpu_gb": round(torch.cuda.max_memory_allocated(device) / 2 ** 30, 2) if device.type == "cuda" else None, "val": None}
+        log.info("epoch %d/%d loss %.4f lr %.2e (%.0fs elapsed)", epoch, cfg.epochs, rec["train_loss"], rec["lr"], time.time() - t_start)
 
         if epoch % cfg.val_interval == 0 or epoch == cfg.epochs:
             model.eval()
@@ -257,13 +313,16 @@ def run(cfg: TrainConfig, resume: bool = False, benchmark: bool = False) -> dict
             hist["val_mean"].append(mean)
             for i, r in enumerate(REGIONS):
                 hist[f"val_{r}"].append(float(sc[i]))
+            rec["val"] = {"mean": mean, **{r: float(sc[i]) for i, r in enumerate(REGIONS)}, "n": len(scores)}
             log.info("  [VAL n=%d] mean %.4f | TC %.4f WT %.4f ET %.4f", len(scores), mean, *sc)
             if mean > best + cfg.min_delta:
                 best, bad_checks = mean, 0
-                save_checkpoint(best_p, model, cfg.arch, {"epoch": epoch, "val_mean_dice": mean, "val_dice": dict(zip(REGIONS, map(float, sc))), "run": str(out)})
-                update_card(best_p, trained_by=f"braintumor {__version__}", run_dir=str(out), epoch=epoch, val_mean_dice=mean, manifest_sha256=man["file_sha256"],
-                            manifest_method=man["method"], config=yaml.safe_load((out / "config.yaml").read_text()),
-                            evaluation=None, note="Validation Dice was used for checkpoint selection; it is NOT a test result. Run braintumor.evaluate on the test split.")
+                meta = {"epoch": epoch, "val_mean_dice": mean, "val_dice": dict(zip(REGIONS, map(float, sc))), "run": str(out)}
+                save_checkpoint(best_p, model, cfg.arch, meta)
+                save_checkpoint(out / "versions" / f"best_e{epoch:03d}.pth", model, cfg.arch, meta)       # versioned copy
+                update_card(best_p, trained_by=f"braintumor {__version__}", git_commit=_git_commit(), run_dir=str(out), epoch=epoch, val_mean_dice=mean,
+                            manifest_sha256=man["file_sha256"], manifest_method=man["method"], config=cfg_dict, datasets=sorted(roots), evaluation=None,
+                            note="Validation Dice was used for checkpoint selection; it is NOT a test result. Run braintumor.evaluate on the held-out splits.")
                 log.info("  new best saved (epoch %d)", epoch)
             else:
                 bad_checks += 1
@@ -271,11 +330,18 @@ def run(cfg: TrainConfig, resume: bool = False, benchmark: bool = False) -> dict
         _atomic_save({"epoch": epoch, "model": model.state_dict(), "optimizer": opt.state_dict(), "scheduler": sched.state_dict(), "scaler": scaler.state_dict(),
                       "best": best, "bad_checks": bad_checks, "history": hist}, last_p)
         (out / "history.json").write_text(json.dumps(hist, indent=1))
+        with open(out / "metrics.jsonl", "a") as f:
+            f.write(json.dumps(rec) + "\n")
         if bad_checks >= cfg.patience:
             log.info("early stopping: no validation improvement for %d checks", bad_checks)
             break
-    finished = epoch >= cfg.epochs or bad_checks >= cfg.patience
-    status = {"finished": bool(finished), "last_epoch": epoch, "best_val_mean_dice": best, "best_checkpoint": str(best_p) if best_p.exists() else None}
+        if budget_s and time.time() - t_start >= budget_s and epoch < cfg.epochs:
+            paused = True
+            log.info("time budget (%.1f h) reached after epoch %d: stopping cleanly - resume with --resume", cfg.max_hours, epoch)
+            break
+    finished = (epoch >= cfg.epochs or bad_checks >= cfg.patience) and not paused
+    status = {"finished": bool(finished), "paused_for_time_budget": paused, "last_epoch": epoch, "best_val_mean_dice": best,
+              "best_checkpoint": str(best_p) if best_p.exists() else None}
     (out / "status.json").write_text(json.dumps(status, indent=1))
     return status
 
@@ -284,21 +350,27 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--config")
     ap.add_argument("--data-root")
+    ap.add_argument("--data-roots", nargs="*", metavar="NAME=PATH", help="several datasets, e.g. brats2020=/data/b20 brats2021=/data/b21")
     ap.add_argument("--manifest")
     ap.add_argument("--out", dest="out_dir")
+    ap.add_argument("--cache-dir")
     ap.add_argument("--arch", choices=["segresnet", "unet"])
     ap.add_argument("--epochs", type=int)
     ap.add_argument("--batch-size", type=int)
+    ap.add_argument("--accum-steps", type=int)
     ap.add_argument("--num-workers", type=int)
     ap.add_argument("--device")
     ap.add_argument("--seed", type=int)
-    ap.add_argument("--loss", choices=["dicece", "dice"])
+    ap.add_argument("--loss", choices=list(LOSSES))
+    ap.add_argument("--max-hours", type=float)
     ap.add_argument("--resume", action="store_true")
     ap.add_argument("--benchmark", action="store_true", help="estimate cost and exit")
     ap.add_argument("--allow-cpu", action="store_true")
     a = ap.parse_args(argv)
-    cfg = TrainConfig.load(a.config, **{k: getattr(a, k) for k in ("data_root", "manifest", "out_dir", "arch", "epochs", "batch_size", "num_workers", "device", "seed", "loss")},
-                           allow_cpu=True if a.allow_cpu else None)
+    roots = dict(s.split("=", 1) for s in a.data_roots) if a.data_roots else None
+    cfg = TrainConfig.load(a.config, **{k: getattr(a, k) for k in ("data_root", "manifest", "out_dir", "cache_dir", "arch", "epochs", "batch_size", "accum_steps",
+                                                                  "num_workers", "device", "seed", "loss", "max_hours")},
+                           data_roots=roots, allow_cpu=True if a.allow_cpu else None)
     print(json.dumps(run(cfg, resume=a.resume, benchmark=a.benchmark), indent=1))
 
 

@@ -1,6 +1,6 @@
 """Brain MRI tumour segmentation, measurement and 3D reconstruction (research prototype)."""
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 #: Channel order the model was trained with (notebook: [t1, t1ce, t2, flair]).
 MODALITIES = ("t1", "t1ce", "t2", "flair")

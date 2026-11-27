@@ -1,0 +1,61 @@
+# Dataset registry. A dataset may be used for training/evaluation only when its label mapping is VERIFIED on the real data
+# (`python -m braintumor audit --dataset <name> ...` compares observed label values with `labels` below and refuses mismatches).
+# `verified: false` entries are documented candidates - nothing about them has been confirmed on actual files in this project.
+# Facts below come from the sources listed (checked 2026-11-27); re-check licences on the source pages before downloading.
+
+brats2020:
+  description: BraTS 2020 training data (369 cases, 368 complete), adult glioma, 4 modalities, skull-stripped, SRI24-registered, 1 mm isotropic
+  case_glob: "*"                         # one sub-folder per patient under the data root
+  files:
+    t1:    ["*_t1.nii*"]
+    t1ce:  ["*_t1ce.nii*"]
+    t2:    ["*_t2.nii*"]
+    flair: ["*_flair.nii*"]
+    seg:   ["*_seg.nii*"]
+  labels: {NCR: 1, ED: 2, ET: 4}         # observed label set in the notebook output: [0 1 2 4]
+  role: pool
+  verified: true                         # label values seen in the original notebook run (cell 4)
+  source: "Kaggle mirror awsaf49/brats20-dataset-training-validation (as used by the notebook); original: BraTS 2020 challenge"
+  license: "BraTS data conditions (research use, cite the BraTS papers); mirror terms on Kaggle"
+
+brats2021:
+  description: RSNA-ASNR-MICCAI BraTS 2021 training data (1251 labelled cases). OFFICIALLY A SUPERSET OF BraTS 2020 - overlapping patients must be grouped/removed
+  case_glob: "BraTS2021_*"
+  files:
+    t1:    ["*_t1.nii*"]
+    t1ce:  ["*_t1ce.nii*"]
+    t2:    ["*_t2.nii*"]
+    flair: ["*_flair.nii*"]
+    seg:   ["*_seg.nii*"]
+  labels: {NCR: 1, ED: 2, ET: 4}         # per the official 2021 page (ET = 4); confirm on the downloaded files
+  role: pool
+  verified: false
+  source: "Synapse syn25829067 (registration + data request required) - https://www.med.upenn.edu/cbica/brats2021/"
+  license: "BraTS data usage conditions via Synapse; access is granted per user"
+
+ucsf_pdgm:
+  description: UCSF Preoperative Diffuse Glioma MRI (TCIA), 495 patients, 3T, skull-stripped, 1 mm isotropic registered to T2/FLAIR; auto + manually corrected labels
+  case_glob: "UCSF-PDGM-*"
+  files:                                  # file name patterns are NOT confirmed on real files; adjust after inspecting the download
+    t1:    ["*_T1_bias.nii*", "*_T1.nii*"]
+    t1ce:  ["*_T1c_bias.nii*", "*_T1c.nii*"]
+    t2:    ["*_T2_bias.nii*", "*_T2.nii*"]
+    flair: ["*_FLAIR_bias.nii*", "*_FLAIR.nii*"]
+    seg:   ["*tumor_segmentation.nii*"]
+  labels: null                            # TCIA page names the compartments but does NOT state integer values -> must be established from data + paper
+  role: external
+  verified: false
+  source: "TCIA, DOI 10.7937/tcia.bdgf-8v37, 142 GB NIfTI via IBM Aspera Connect (no DICOM)"
+  license: "CC BY 4.0 + TCIA Data Usage Policy"
+  notes: "Part of BraTS 2021 (TCIA metadata CSV maps UCSF IDs to BraTS 2021 IDs - use it for leakage control). A subset download is preferable to 142 GB."
+
+upenn_gbm:
+  description: UPenn-GBM (TCIA), 630 de novo glioblastoma patients, multiparametric MRI, auto + expert-corrected segmentation
+  case_glob: "UPENN-GBM-*"
+  files: {}
+  labels: null
+  role: external
+  verified: false
+  source: "TCIA, DOI 10.7937/TCIA.709X-DN49"
+  license: "CC BY 4.0 per one TCIA metadata record, CC BY 3.0 per older TCIA pages - CONFIRM on the collection page"
+  notes: "Penn/CBICA cases also appear in BraTS challenge data: likely patient overlap with BraTS 2020/2021; needs dedup before use as external."

@@ -1,6 +1,6 @@
 [project]
 name = "braintumor"
-version = "0.2.0"
+version = "0.3.0"
 description = "Brain MRI tumour segmentation, physical measurement and 3D reconstruction (research prototype)"
 requires-python = ">=3.10"
 dependencies = [

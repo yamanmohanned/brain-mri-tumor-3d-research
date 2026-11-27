@@ -24,6 +24,7 @@ from ..io import AmbiguousSeriesError, InputError, load_dicom_series, load_label
 from ..model import CheckpointError, find_checkpoints, load_checkpoint
 from ..pipeline import AnalysisConfig
 from ..report import build_report, render_html
+from .help_content import GUIDE_HTML, METRIC_NOTE, TOOLTIPS, WELCOME_STEPS
 from .style import QSS, evidence_style
 from .widgets import OrthoViewer, Viewer3D
 from .workers import AnalysisWorker
@@ -64,6 +65,7 @@ class AppState(QObject):
     model_changed = pyqtSignal()
     result_changed = pyqtSignal()
     cursor_changed = pyqtSignal(list)
+    progress_changed = pyqtSignal()          # first-use checklist needs a refresh (viewed / exported)
 
     def __init__(self, weights_dir: Path | None = None, history_path: Path | None = None):
         super().__init__()
@@ -81,6 +83,8 @@ class AppState(QObject):
         self.cfg = AnalysisConfig(infer=InferenceConfig(device="auto"))
         self.case_id = "case"
         self.cursor = [0, 0, 0]
+        self.viewed = False
+        self.exported = False
 
     def load_volume(self, vol, labels=None, label_source="", case_id="case") -> None:
         self.volume, self.labels, self.label_source, self.case_id = vol, labels, label_source, case_id
@@ -88,6 +92,7 @@ class AppState(QObject):
         self.grid = make_working_grid(vol.affine, vol.shape)
         self.display = self.grid.to_work(vol.data, order=1).astype(np.float32)
         self.result = None
+        self.viewed = self.exported = False
         self.volume_changed.emit()
         self.result_changed.emit()
 
@@ -204,7 +209,9 @@ class DashboardPage(QWidget):
         self.c_model, self.c_fmt, self.c_hw = Card("Model & validation status"), Card("Supported MRI input"), Card("Hardware status")
         grid.addWidget(self.c_model, 0, 0, 1, 2)
         grid.addWidget(self.c_fmt, 0, 2)
-        grid.addWidget(self.c_hw, 1, 0, 1, 3)
+        self.c_guide = Card("First-use guide")
+        grid.addWidget(self.c_guide, 1, 0, 1, 3)
+        grid.addWidget(self.c_hw, 2, 0, 1, 3)
         lay.addLayout(grid)
         row = QHBoxLayout()
         self.combo = QComboBox()
@@ -213,6 +220,8 @@ class DashboardPage(QWidget):
         b_load.setObjectName("primary")
         b_load.clicked.connect(lambda: self._load(self.combo.currentData()))
         b_browse.clicked.connect(self._browse)
+        b_load.setToolTip(TOOLTIPS["load_model"])
+        b_browse.setToolTip(TOOLTIPS["load_model"])
         row.addWidget(self.combo)
         row.addWidget(b_load)
         row.addWidget(b_browse)
@@ -230,7 +239,22 @@ class DashboardPage(QWidget):
                                 "Other inputs are flagged as out-of-distribution.</span>")
         state.model_changed.connect(self.refresh)
         state.result_changed.connect(self.refresh)
+        for sig in (state.volume_changed, state.model_changed, state.result_changed, state.progress_changed):
+            sig.connect(self.refresh_guide)
         self.refresh()
+        self.refresh_guide()
+
+    def refresh_guide(self):
+        s = self.state
+        steps = [("Load a model (or skip this step and measure a supplied annotation)", s.model is not None or s.labels is not None),
+                 ("Upload the four MRI modalities and press 'Validate & load scan'", s.volume is not None),
+                 ("Run the segmentation on the Analysis page and check the overlay against the images", s.result is not None),
+                 ("Inspect the 3D View and read the Results page", s.result is not None and s.viewed),
+                 ("Export the mask, meshes and report", s.exported)]
+        nxt = next((t for t, done in steps if not done), None)
+        lines = "".join(f"<div>{'&#10003;' if done else '&#9675;'}&nbsp; {t}</div>" for t, done in steps)
+        self.c_guide.body.setText(lines + (f"<br><b>Next:</b> {nxt}" if nxt else "<br><b>All steps done.</b> Remember: this is a research output, not a diagnosis.")
+                                  + "<br><small style='color:#5b6b78'>The <b>Guide</b> page explains modalities, measurements and metrics.</small>")
 
     def _load(self, path):
         if not path:
@@ -271,6 +295,8 @@ class DashboardPage(QWidget):
             self.c_model.body.setText(
                 f"<b>{Path(mi['path']).name}</b> &nbsp; <code>{mi['arch']}</code> &middot; {mi['n_params'] / 1e6:.2f} M parameters &middot; sha256 <code>{mi['sha256'][:12]}</code><br>"
                 f"Evidence level: <span style='{evidence_style(lvl)}'>&nbsp;{lvl}&nbsp;</span><br>"
+                f"<small>Trained on: {', '.join(card.get('datasets', [])) or 'not recorded'} &middot; training split: {card.get('manifest_method', 'not recorded')} &middot; "
+                f"architecture <code>{mi['arch']}</code></small><br>"
                 + (f"<small>Held-out evaluation on {ev.get('n_test')} patients ({ev.get('split')} split):</small><br>{summ}" if ev else "")
                 + (f"<ul style='margin-top:2px'>{why}</ul>" if why else "")
                 + "<small style='color:#5b6b78'>Evidence levels describe research validation, not clinical approval.</small>")
@@ -310,6 +336,7 @@ class UploadPage(QWidget):
             e = QLineEdit()
             e.setPlaceholderText(f"{MOD_LABEL[m]} NIfTI file (.nii / .nii.gz)")
             b = QPushButton("Browse...")
+            b.setToolTip(TOOLTIPS["nifti_pick"])
             b.clicked.connect(lambda _, mm=m: self._pick_nifti(mm))
             row = QHBoxLayout()
             row.addWidget(e, 1)
@@ -317,6 +344,7 @@ class UploadPage(QWidget):
             fl.addRow(MOD_LABEL[m], row)
             self.edits[m] = e
         auto = QPushButton("Auto-fill from folder (BraTS-style names)...")
+        auto.setToolTip(TOOLTIPS["autofill"])
         auto.clicked.connect(self._autofill)
         fl.addRow("", auto)
         fd = QFormLayout(dic)
@@ -324,6 +352,7 @@ class UploadPage(QWidget):
             l = QLabel("not selected")
             l.setObjectName("muted")
             b = QPushButton("Series folder...")
+            b.setToolTip(TOOLTIPS["dicom_pick"])
             b.clicked.connect(lambda _, mm=m: self._pick_dicom(mm))
             row = QHBoxLayout()
             row.addWidget(l, 1)
@@ -338,15 +367,18 @@ class UploadPage(QWidget):
         self.seg_edit = QLineEdit()
         self.seg_edit.setPlaceholderText("BraTS-style label map (labels 1, 2, 4) - e.g. ground truth. Measured and shown as ANNOTATION, never as a prediction.")
         bs = QPushButton("Browse...")
+        bs.setToolTip(TOOLTIPS["seg_pick"])
         bs.clicked.connect(self._pick_seg)
         gl.addWidget(self.seg_edit, 1)
         gl.addWidget(bs)
         lay.addWidget(g)
         row = QHBoxLayout()
         self.btn_load = QPushButton("Validate && load scan")
+        self.btn_load.setToolTip(TOOLTIPS["validate"])
         self.btn_load.setObjectName("primary")
         self.btn_load.clicked.connect(self.validate)
         self.btn_next = QPushButton("Continue to analysis  >")
+        self.btn_next.setToolTip(TOOLTIPS["next"])
         self.btn_next.setEnabled(False)
         self.btn_next.clicked.connect(lambda: main.show_page("analysis"))
         row.addWidget(self.btn_load)
@@ -468,6 +500,7 @@ class AnalysisPage(QWidget):
         lay.addWidget(page_header("Analysis workspace", "Scroll or drag in any view to move through the volume; the crosshair is shared by all three planes."))
         bar = QHBoxLayout()
         self.mod = QComboBox()
+        self.mod.setToolTip(TOOLTIPS["modality"])
         for m in MODALITIES:
             self.mod.addItem(MOD_LABEL[m], m)
         self.mod.setCurrentIndex(3)
@@ -475,24 +508,27 @@ class AnalysisPage(QWidget):
         self.chk = {r: QCheckBox(r) for r in ("WT", "TC", "ET")}
         for r, c in self.chk.items():
             c.setChecked(True)
-            c.setToolTip(REGION_NAMES[r])
+            c.setToolTip(TOOLTIPS["overlay_" + r.lower()])
             c.toggled.connect(self._overlay)
         self.op = QSlider(Qt.Orientation.Horizontal)
+        self.op.setToolTip(TOOLTIPS["opacity"])
         self.op.setRange(0, 100)
         self.op.setValue(45)
         self.op.setMaximumWidth(140)
         self.op.valueChanged.connect(self._overlay)
         self.tta = QCheckBox("Flip-TTA uncertainty (4x slower)")
+        self.tta.setToolTip(TOOLTIPS["tta"])
         self.minc = QDoubleSpinBox()
         self.minc.setRange(0, 5000)
         self.minc.setDecimals(0)
         self.minc.setSuffix(" mm3")
-        self.minc.setToolTip("Optional: drop predicted components smaller than this. 0 (default) removes nothing - removal is logged in the report.")
+        self.minc.setToolTip(TOOLTIPS["min_component"])
         for w in (QLabel("Modality"), self.mod, QLabel("   Overlay"), *self.chk.values(), QLabel("opacity"), self.op, QLabel("  Ignore components <"), self.minc, self.tta):
             bar.addWidget(w)
         bar.addStretch(1)
         lay.addLayout(bar)
         self.ortho = OrthoViewer()
+        self.ortho.setToolTip("Click or drag to place the crosshair; scroll to change slice. " + TOOLTIPS["plane_axial"])
         self.ortho.cursor_changed.connect(self._cursor)
         lay.addWidget(self.ortho, 1)
         self.readout = QLabel(" ")
@@ -506,6 +542,7 @@ class AnalysisPage(QWidget):
         self.btn_annot = QPushButton("Measure supplied annotation (no model)")
         self.btn_annot.clicked.connect(self.run_annotation)
         self.btn_cancel = QPushButton("Cancel")
+        self.btn_cancel.setToolTip(TOOLTIPS["cancel"])
         self.btn_cancel.setObjectName("danger")
         self.btn_cancel.setEnabled(False)
         self.btn_cancel.clicked.connect(lambda: self.worker and self.worker.cancel())
@@ -532,9 +569,9 @@ class AnalysisPage(QWidget):
         s, busy = self.state, self.worker is not None and self.worker.isRunning()
         have = s.volume is not None and not busy
         self.btn_model.setEnabled(have and s.model is not None)
-        self.btn_model.setToolTip("" if s.model is not None else "Load a model checkpoint on the Dashboard first")
+        self.btn_model.setToolTip(TOOLTIPS["run_model"] if s.model is not None else "Load a model checkpoint on the Dashboard first (Load selected).")
         self.btn_annot.setEnabled(have and s.labels is not None)
-        self.btn_annot.setToolTip("" if s.labels is not None else "Supply a segmentation on the Upload page")
+        self.btn_annot.setToolTip(TOOLTIPS["run_annotation"] if s.labels is not None else "Supply a segmentation file on the MRI Upload page first.")
         self.btn_cancel.setEnabled(busy)
 
     def _bg(self):
@@ -660,11 +697,15 @@ class Viewer3DPage(QWidget):
         self.c_feret.toggled.connect(lambda on: self.view.set_visible("feret", on))
         self.c_planes = QCheckBox("MRI slice planes at crosshair")
         self.c_planes.toggled.connect(self._planes)
+        for k, c in self.chk.items():
+            c.setToolTip(TOOLTIPS["view3d_brain"] if k == "brain" else TOOLTIPS["view3d_wt"])
+        self.c_feret.setToolTip(TOOLTIPS["view3d_feret"])
+        self.c_planes.setToolTip(TOOLTIPS["view3d_planes"])
         gl.addWidget(self.c_feret, 4, 0, 1, 2)
         gl.addWidget(self.c_planes, 5, 0, 1, 2)
         self.smooth = QSpinBox()
         self.smooth.setRange(0, 50)
-        self.smooth.setToolTip("Display-only Taubin smoothing iterations (0 = faithful surface). Never used for measurements.")
+        self.smooth.setToolTip(TOOLTIPS["view3d_smooth"])
         b_s = QPushButton("Apply")
         b_s.clicked.connect(lambda: self._rebuild())
         gl.addWidget(QLabel("Display smoothing iterations"), 6, 0)
@@ -737,6 +778,10 @@ class ResultsPage(QWidget):
         lay.addWidget(page_header("Results and evaluation", "Predictions, measurements, validation evidence, warnings and limitations - kept separate on purpose."))
         self.badge = QLabel()
         lay.addWidget(self.badge)
+        note = QLabel(METRIC_NOTE)
+        note.setObjectName("muted")
+        note.setWordWrap(True)
+        lay.addWidget(note)
         self.text = QTextBrowser()
         lay.addWidget(self.text, 1)
         state.result_changed.connect(self.refresh)
@@ -767,8 +812,9 @@ class ExportPage(QWidget):
         fl = QFormLayout(g)
         self.items = {"mask": QCheckBox("Segmentation mask (NIfTI, BraTS labels 1/2/4)"), "meshes": QCheckBox("3D meshes (WT, TC, ET)"),
                       "report": QCheckBox("Report (JSON + HTML)"), "csv": QCheckBox("Measurements (CSV)"), "images": QCheckBox("Images (3 planes + 3D view)")}
-        for c in self.items.values():
+        for k, c in self.items.items():
             c.setChecked(True)
+            c.setToolTip(TOOLTIPS["export_" + k])
             fl.addRow(c)
         self.fmt = QComboBox()
         self.fmt.addItems(["stl", "obj", "ply"])
@@ -820,6 +866,8 @@ class ExportPage(QWidget):
                     self.log.append("Export cancelled (nothing overwritten).")
                     return
         self.log.append(f"<b>Exported to {out}</b>")
+        s.exported = True
+        s.progress_changed.emit()
         for k, v in w.items():
             for p in v:
                 self.log.append(f"&nbsp;&nbsp;{k}: {Path(p).name}")
@@ -829,10 +877,29 @@ class ExportPage(QWidget):
             pass
 
 
+class HelpPage(QWidget):
+    def __init__(self, state: AppState, main):
+        super().__init__()
+        self.setObjectName("page")
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(24, 20, 24, 12)
+        lay.addWidget(page_header("Guide", "How to use this application, what the numbers mean - and what they do not mean."))
+        row = QHBoxLayout()
+        b = QPushButton("Show the first-use walkthrough")
+        b.setToolTip("Re-opens the short step-by-step introduction shown on first launch.")
+        b.clicked.connect(lambda: main.show_welcome(force=True))
+        row.addWidget(b)
+        row.addStretch(1)
+        lay.addLayout(row)
+        self.text = QTextBrowser()
+        self.text.setHtml(GUIDE_HTML)
+        lay.addWidget(self.text, 1)
+
+
 # ----------------------------------------------------------------------------- main window
 
 class MainWindow(QMainWindow):
-    PAGES = [("dashboard", "Dashboard"), ("upload", "MRI Upload"), ("analysis", "Analysis"), ("3d", "3D View"), ("results", "Results"), ("export", "Export")]
+    PAGES = [("dashboard", "Dashboard"), ("upload", "MRI Upload"), ("analysis", "Analysis"), ("3d", "3D View"), ("results", "Results"), ("export", "Export"), ("guide", "Guide")]
 
     def __init__(self, state: AppState | None = None):
         super().__init__()
@@ -869,7 +936,7 @@ class MainWindow(QMainWindow):
         self.stack = QStackedWidget()
         self.pg = {}
         self.page3d = Viewer3DPage(self.state, self)
-        for key, cls in (("dashboard", DashboardPage), ("upload", UploadPage), ("analysis", AnalysisPage), ("3d", None), ("results", ResultsPage), ("export", ExportPage)):
+        for key, cls in (("dashboard", DashboardPage), ("upload", UploadPage), ("analysis", AnalysisPage), ("3d", None), ("results", ResultsPage), ("export", ExportPage), ("guide", HelpPage)):
             w = self.page3d if key == "3d" else cls(self.state, self)
             self.pg[key] = w
             self.stack.addWidget(w)
@@ -882,6 +949,7 @@ class MainWindow(QMainWindow):
         self._enable()
         self.nav.setCurrentRow(0)
         QTimer.singleShot(0, self._auto_model)
+        QTimer.singleShot(400, self.show_welcome)
 
     def _auto_model(self):
         """Load a checkpoint automatically only if exactly one candidate exists (never guess between several)."""
@@ -894,7 +962,7 @@ class MainWindow(QMainWindow):
 
     def _enable(self):
         s = self.state
-        enabled = {"dashboard": True, "upload": True, "analysis": s.volume is not None, "3d": s.result is not None, "results": s.result is not None,
+        enabled = {"dashboard": True, "upload": True, "analysis": s.volume is not None, "3d": s.result is not None, "results": s.result is not None, "guide": True,
                    "export": s.result is not None}
         for i, (k, _) in enumerate(self.PAGES):
             it = self.nav.item(i)
@@ -906,6 +974,26 @@ class MainWindow(QMainWindow):
     def _nav(self, row):
         if row >= 0:
             self.stack.setCurrentIndex(row)
+            if self.PAGES[row][0] in ("3d", "results") and self.state.result is not None and not self.state.viewed:
+                self.state.viewed = True
+                self.state.progress_changed.emit()
+
+    def show_welcome(self, force: bool = False) -> None:
+        """First-use walkthrough (once; suppressed by $BRAINTUMOR_NO_WELCOME, e.g. in automated tests)."""
+        from PyQt6.QtCore import QSettings
+        st = QSettings("braintumor", "gui")
+        if not force and (os.environ.get("BRAINTUMOR_NO_WELCOME") or st.value("welcome_shown", False, type=bool)):
+            return
+        steps = "".join(f"<li><b>{t}</b> - {d}</li>" for t, d in WELCOME_STEPS)
+        box = QMessageBox(self)
+        box.setWindowTitle("Welcome - first-use walkthrough")
+        box.setTextFormat(Qt.TextFormat.RichText)
+        box.setText(f"<h3>Welcome</h3><ol>{steps}</ol><p><b>{RESEARCH_DISCLAIMER}</b></p><p>The <i>Guide</i> page explains modalities, measurements and metrics.</p>")
+        cb = QCheckBox("Do not show this again")
+        box.setCheckBox(cb)
+        box.exec()
+        if cb.isChecked():
+            st.setValue("welcome_shown", True)
 
     def show_page(self, key: str) -> None:
         self.nav.setCurrentRow([k for k, _ in self.PAGES].index(key))

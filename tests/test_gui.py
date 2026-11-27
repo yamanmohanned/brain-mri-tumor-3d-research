@@ -131,8 +131,8 @@ def _inject_model(env):
 def test_starts_without_model_and_gates_pages_until_data_exists(app_env):
     win = app_env["win"]
     assert "No model loaded" in win.pg["dashboard"].c_model.body.text()
-    en = [bool(win.nav.item(i).flags() & Qt_enabled()) for i in range(6)]
-    assert en == [True, True, False, False, False, False]
+    en = [bool(win.nav.item(i).flags() & Qt_enabled()) for i in range(7)]
+    assert en == [True, True, False, False, False, False, True]          # Dashboard, Upload, ..., Guide (always available)
     assert not win.pg["analysis"].btn_model.isEnabled()
     up = _load_via_upload(app_env)
     assert up.btn_next.isEnabled() and app_env["state"].volume is not None
@@ -172,7 +172,7 @@ def test_full_workflow_model_run_3d_results_export(app_env, qtbot):
     assert res.source == "model" and res.measurements["WT"]["present"]
     truth = app_env["ph"]["truth"]["WT_voxels_volume_mm3"]
     assert abs(res.measurements["WT"]["volume_mm3"] - truth) / truth < 0.05
-    assert all(bool(win.nav.item(i).flags() & Qt_enabled()) for i in range(6))
+    assert all(bool(win.nav.item(i).flags() & Qt_enabled()) for i in range(7))
     assert "MODEL PREDICTION" in an.banner.text() and an.ortho.masks is not None
     # slice interaction: clicking the crosshair pixel keeps the voxel; sliders and views stay in sync
     cur = list(an.ortho.cursor)
@@ -212,6 +212,8 @@ def test_full_workflow_model_run_3d_results_export(app_env, qtbot):
     assert json.loads((out / "PH_001_report.json").read_text())["provenance"]["result_type"] == "model prediction"
     hist = json.loads((app_env["tmp"] / "history.json").read_text())
     assert hist[-1]["case"] == "PH_001" and hist[-1]["evidence"] == "Not validated"
+    # the first-use checklist followed the whole workflow
+    assert "All steps done" in win.pg["dashboard"].c_guide.body.text()
 
 
 def test_annotation_mode_labels_result_as_annotation(app_env, qtbot):
@@ -267,4 +269,52 @@ def test_dashboard_shows_checkpoint_and_its_evidence_level(qtbot, tmp_path, monk
     t = win.pg["dashboard"].c_model.body.text()
     assert "Experimental / preliminary" in t and "acceptance criteria not met" in t and "0.89" in t
     assert "Experimental / preliminary" in win.evid.text()
+    win.close()
+
+
+def test_in_app_guidance_tooltips_guide_page_and_checklist(app_env):
+    win, s = app_env["win"], app_env["state"]
+    dash = win.pg["dashboard"]
+    t0 = dash.c_guide.body.text()
+    assert "Next:" in t0 and "&#10003;" not in t0                                   # nothing done yet; first step suggested
+    up = _load_via_upload(app_env)
+    t1 = dash.c_guide.body.text()
+    assert "&#10003;" in t1 and "Load a model" in t1.split("Next:")[1]              # scan validated, but no model -> the next useful step is loading one
+    # every important control explains itself
+    an, ex = win.pg["analysis"], win.pg["export"]
+    for w in (up.btn_load, up.btn_next, up.seg_edit.parent().findChildren(type(up.btn_load))[0], an.mod, an.op, an.tta, an.minc, an.btn_model, an.btn_annot,
+              an.btn_cancel, *an.chk.values(), *ex.items.values(), win.pg["3d"].c_feret, win.pg["3d"].c_planes, win.pg["3d"].smooth):
+        assert w.toolTip().strip(), w
+    assert "Load a model" in an.btn_model.toolTip()                                  # disabled button says WHY
+    # Guide page explains modalities, metrics and the three kinds of certainty
+    g = win.pg["guide"].text.toPlainText()
+    for needle in ("T1ce", "FLAIR", "skull-stripped", "Dice (DSC)", "HD95", "Surface Dice", "Model confidence", "Segmentation accuracy", "Clinical certainty",
+                   "No number here is a diagnosis", "Not validated", "co-registered"):
+        assert needle in g, needle
+    from PyQt6.QtWidgets import QLabel
+    assert any("NOT accuracy" in l.text() for l in win.pg["results"].findChildren(QLabel))
+
+
+def test_welcome_walkthrough_is_available_and_suppressible(app_env, monkeypatch):
+    from braintumor.gui.help_content import WELCOME_STEPS
+    win = app_env["win"]
+    shown = []
+    monkeypatch.setattr(app_env["A"].QMessageBox, "exec", lambda self: shown.append(self.text()) or 0)
+    win.show_welcome()                                                               # suppressed by BRAINTUMOR_NO_WELCOME (set in conftest)
+    assert shown == []
+    win.show_welcome(force=True)
+    assert len(shown) == 1 and all(t in shown[0] for t, _ in WELCOME_STEPS) and "NOT A MEDICAL DEVICE" in shown[0]
+
+
+def test_dashboard_reports_training_datasets_and_split_of_the_loaded_model(qtbot, tmp_path, monkeypatch):
+    from braintumor.gui import app as A
+    monkeypatch.setattr(A, "err_box", lambda *a, **k: None)
+    ck = save_checkpoint(tmp_path / "w" / "m.pth", build_model("segresnet"), "segresnet")
+    update_card(ck, datasets=["brats2020"], manifest_method="legacy_notebook_random.Random(42)_shuffle_70/15/15")
+    state = A.AppState(weights_dir=tmp_path / "w", history_path=tmp_path / "h.json")
+    win = A.MainWindow(state)
+    qtbot.addWidget(win)
+    qtbot.waitUntil(lambda: state.model is not None, timeout=20_000)
+    t = win.pg["dashboard"].c_model.body.text()
+    assert "Trained on: brats2020" in t and "legacy_notebook" in t and "segresnet" in t
     win.close()

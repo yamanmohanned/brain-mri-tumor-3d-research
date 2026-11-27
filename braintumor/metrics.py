@@ -129,7 +129,8 @@ def summarize_metrics(rows: list[dict], metrics=("dice", "iou", "precision", "re
              "metrics": {}}
         s["missed_rate"] = s["n_missed"] / max(s["n_gt_present"], 1)
         for m in metrics:
-            s["metrics"][m] = bootstrap_ci(d[m].to_numpy(), seed=seed, n_boot=n_boot)
+            if m in d.columns:
+                s["metrics"][m] = bootstrap_ci(d[m].to_numpy(), seed=seed, n_boot=n_boot)
         # hd95 / assd restricted to cases where both masks are non-empty (no penalties) - reported alongside the penalised numbers
         both = d[~d.gt_empty & ~d.pred_empty]
         for m in ("hd95_raw", "assd_raw"):

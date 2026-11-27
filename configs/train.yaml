@@ -19,3 +19,9 @@ cache: true                             # on-disk MONAI PersistentDataset cache 
 seed: 42
 flip_axes: [0]                          # left-right only (anatomy-preserving)
 sw_overlap: 0.25
+# --- cloud-session options (defaults shown) ---
+accum_steps: 1                          # effective batch = batch_size x accum_steps; auto_batch re-splits it to fit the GPU
+auto_batch: true
+cache_dir: ""                           # set to local disk (e.g. /content/cache) when --out is on Google Drive
+deterministic: false
+max_hours: 0.0                          # e.g. 3.5 on free Colab: stops cleanly after the epoch that crosses the budget; rerun with --resume

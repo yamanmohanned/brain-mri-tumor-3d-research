@@ -107,12 +107,12 @@ def save_phantom(ph: dict, folder: Path, case_id: str, with_seg=True) -> dict:
     return files
 
 
-def make_brats_like_dataset(root: Path, n: int = 12, shape=(48, 52, 40), seed=0) -> list[str]:
+def make_brats_like_dataset(root: Path, n: int = 12, shape=(48, 52, 40), seed=0, prefix: str = "BraTS20_Training_") -> list[str]:
     """Tiny BraTS-structured directory (BraTS20_Training_001 ...) of phantoms with varied tumour sizes."""
     rng = np.random.default_rng(seed)
     ids = []
     for i in range(1, n + 1):
-        cid = f"BraTS20_Training_{i:03d}"
+        cid = f"{prefix}{i:03d}"
         r = rng.uniform(5, 9, 3)
         ph = make_phantom(shape, (1, 1, 1), "ras", tuple(r), center_frac=tuple(rng.uniform(0.4, 0.6, 3)), n_et=bool(i % 4),
                           seed=int(rng.integers(1e6)))

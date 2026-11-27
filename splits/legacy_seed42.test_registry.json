@@ -1,0 +1,13 @@
+{
+  "entries": [],
+  "historical": {
+    "test": [
+      {
+        "description": "Original Colab notebook (cell 12) evaluated SegResNet and 3D U-Net on this test split side by side; cell 13 then called SegResNet the 'winning' model used for the downstream demo and app.",
+        "n_models": 2,
+        "source": "notebooks/legacy/brain_tumor_project.ipynb cells 12-13",
+        "consequence": "This test split was used to compare models and is therefore NOT an untouched independent benchmark. Results are kept for reproducibility only."
+      }
+    ]
+  }
+}

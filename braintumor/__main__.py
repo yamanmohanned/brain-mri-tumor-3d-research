@@ -12,13 +12,15 @@ from . import _preload  # noqa: F401  (torch must be imported before any Qt bind
 def _audit(a):
     from .audit import audit_dataset, legacy_split_consistency, save_audit
     from .splits import load_manifest
-    res = audit_dataset(a.data_root, workers=a.workers, progress=lambda i, n: print(f"\r  audited {i}/{n}", end="", flush=True))
+    from .datasets import get_spec
+    res = audit_dataset(a.data_root, get_spec(a.dataset), workers=a.workers, progress=lambda i, n: print(f"\r  audited {i}/{n}", end="", flush=True))
     print()
     save_audit(res, a.out)
     s = res["summary"]
     print(json.dumps({k: s[k] for k in ("n_folders", "n_complete", "n_with_problems", "skipped_incomplete", "shapes", "spacings", "orientations", "label_sets",
                                          "n_without_ET", "multifocal_WT_cases", "exact_duplicate_groups")}, indent=1, default=str))
     print("GT volume (cm3):", json.dumps(s["gt_volume_cm3"]))
+    print("Label mapping check:", json.dumps(s["label_mapping_check"]))
     if s["near_duplicate_candidates"]:
         print("Near-duplicate candidates (manual review):", s["near_duplicate_candidates"][:10])
     if a.manifest:
@@ -43,6 +45,36 @@ def _split(a):
         verify_split(sp, res["summary"]["exact_duplicate_groups"])
     man = save_manifest(a.out, sp, method=a.method, seed=a.seed, dataset="BraTS2020 training", notes=notes)
     print(json.dumps(man["counts"]), "->", a.out)
+
+
+def _split_combined(a):
+    from .audit import cross_duplicate_pairs, load_audit_bundle
+    from .datasets import load_registry
+    from .splits import build_combined_split, load_manifest, save_manifest
+    reg = load_registry()
+    bundles = {}
+    for spec_str in a.audit:
+        name, _, d = spec_str.partition("=")
+        bundles[name] = load_audit_bundle(d)
+        if name in reg and not reg[name].verified:
+            print(f"WARNING: dataset {name!r} is not verified in the registry; its label mapping was only checked by the audit")
+        chk = bundles[name]["summary"]["label_mapping_check"]
+        if not chk["consistent"]:
+            raise SystemExit(f"dataset {name}: label mapping inconsistent ({chk['reason']}) - refusing to build a split")
+    cases = [r for b in bundles.values() for r in b["cases"]]
+    pairs = cross_duplicate_pairs(bundles, a.dup_corr)
+    legacy = {}
+    if a.legacy:
+        for k, ids in load_manifest(a.legacy)["splits"].items():
+            legacy.update({i: k for i in ids})
+    ext = [n for n in bundles if reg.get(n) and reg[n].role == "external"]
+    sp, info = build_combined_split(cases, seed=a.seed, fractions=tuple(a.fractions), legacy=legacy, pairs=pairs, external_datasets=ext)
+    info["cross_dataset_duplicate_pairs"] = [p for p in pairs if p["cross_dataset"]]
+    info["datasets"] = {n: {"n_cases": len(b["cases"]), "label_mapping": b["summary"]["label_mapping_check"]["declared"]} for n, b in bundles.items()}
+    man = save_manifest(a.out, sp, method="combined_patient_level", seed=a.seed, dataset="+".join(bundles), notes="see split_audit",
+                        extra={"split_audit": info, "legacy_manifest": a.legacy, "dup_corr_threshold": a.dup_corr})
+    print(json.dumps({"counts": man["counts"], "per_split": info["per_split"], "overlap": info["patient_overlap_between_splits"],
+                      "rejected": info["n_rejected"], "duplicate_groups": len(info["duplicate_groups"])}, indent=1))
 
 
 def _analyze(a):
@@ -76,6 +108,7 @@ def main(argv=None):
     p.add_argument("--data-root", required=True)
     p.add_argument("--out", default="runs/audit")
     p.add_argument("--manifest", help="legacy manifest to cross-check against the notebook's printed facts")
+    p.add_argument("--dataset", default="brats2020", help="registry name in configs/datasets.yaml")
     p.add_argument("--workers", type=int, default=4)
     p.set_defaults(fn=_audit)
     p = sub.add_parser("split", help="write a patient-level split manifest")
@@ -85,6 +118,14 @@ def main(argv=None):
     p.add_argument("--out", default="splits/new.json")
     p.add_argument("--workers", type=int, default=4)
     p.set_defaults(fn=_split)
+    p = sub.add_parser("split-combined", help="multi-dataset patient-level split (keeps legacy assignments, groups duplicates, reserves an external cohort)")
+    p.add_argument("--audit", action="append", required=True, metavar="DATASET=AUDIT_DIR", help="repeat per dataset")
+    p.add_argument("--legacy", help="legacy manifest whose assignments are kept (splits/legacy_seed42.json)")
+    p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--fractions", type=float, nargs=3, default=[0.70, 0.15, 0.15])
+    p.add_argument("--dup-corr", type=float, default=0.99)
+    p.add_argument("--out", default="splits/combined_patient_level_v1.json")
+    p.set_defaults(fn=_split_combined)
     p = sub.add_parser("analyze", help="headless analysis of one case")
     for m in ("t1", "t1ce", "t2", "flair"):
         p.add_argument(f"--{m}", required=True)
@@ -99,6 +140,7 @@ def main(argv=None):
     p.set_defaults(fn=_analyze)
     sub.add_parser("train", help="see python -m braintumor.train -h")
     sub.add_parser("evaluate", help="see python -m braintumor.evaluate -h")
+    sub.add_parser("compare", help="paired comparison of two evaluations: python -m braintumor.compare -h")
     sub.add_parser("gui", help="launch the desktop application")
     args, rest = ap.parse_known_args(argv)
     if args.cmd == "train":
@@ -106,6 +148,9 @@ def main(argv=None):
         return m(rest)
     if args.cmd == "evaluate":
         from .evaluate import main as m
+        return m(rest)
+    if args.cmd == "compare":
+        from .compare import main as m
         return m(rest)
     if args.cmd == "gui":
         from .gui.app import main as m

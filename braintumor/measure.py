@@ -169,3 +169,24 @@ def round_for_display(m: dict) -> dict:
     if "surface_area_mm2" in r:
         r["surface_area_cm2"] = round(r["surface_area_mm2"] / 100.0, 1)
     return r
+
+
+def measurement_errors(pred: np.ndarray, gt: np.ndarray, affine: np.ndarray) -> dict:
+    """Predicted-vs-ground-truth physical measurement differences for ONE region (signed = prediction - truth). {} unless both are non-empty."""
+    from .mesh import mask_to_mesh
+    mp = measure_region(pred, affine, mask_to_mesh(pred, affine), with_axial=True)
+    mg = measure_region(gt, affine, mask_to_mesh(gt, affine), with_axial=True)
+    if not (mp.get("present") and mg.get("present")):
+        return {}
+    d = {
+        "m_vol_err_cm3": mp["volume_cm3"] - mg["volume_cm3"], "m_vol_rel_err_pct": 100.0 * (mp["volume_cm3"] - mg["volume_cm3"]) / mg["volume_cm3"],
+        "m_max_diam_err_mm": mp["max_diameter_mm"] - mg["max_diameter_mm"], "m_length_err_mm": mp["length_mm"] - mg["length_mm"],
+        "m_width_err_mm": mp["width_mm"] - mg["width_mm"], "m_height_err_mm": mp["height_mm"] - mg["height_mm"],
+        "m_axial_diam_err_mm": mp["axial_max_diameter_mm"] - mg["axial_max_diameter_mm"],
+        "m_surface_area_err_cm2": (mp["surface_area_mm2"] - mg["surface_area_mm2"]) / 100.0,
+        "m_centroid_dist_mm": float(np.linalg.norm(np.array(mp["centroid_world_mm"]) - np.array(mg["centroid_world_mm"]))),
+    }
+    for k in ("m_vol_err_cm3", "m_max_diam_err_mm", "m_surface_area_err_cm2"):
+        d[k.replace("_err_", "_abs_err_")] = abs(d[k])
+    d["m_vol_abs_rel_err_pct"] = abs(d["m_vol_rel_err_pct"])
+    return d
